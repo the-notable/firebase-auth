@@ -2,7 +2,6 @@ use base64::{prelude::BASE64_STANDARD_NO_PAD, Engine};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use std::{
-    env,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
@@ -11,7 +10,6 @@ use tracing::*;
 
 use crate::structs::{JwkConfiguration, JwkKeys, KeyResponse, PublicKeysError};
 
-const FALLBACK_TIMEOUT: Duration = Duration::from_secs(60);
 const JWK_URL: &str =
     "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com";
 
@@ -46,7 +44,7 @@ fn parse_max_age_value(cache_control_value: &str) -> Result<Duration, PublicKeys
     }
 }
 
-async fn get_public_keys() -> Result<JwkKeys, PublicKeysError> {
+async fn get_public_keys(fallback_timeout: &Duration) -> Result<JwkKeys, PublicKeysError> {
     let response = reqwest::get(JWK_URL)
         .await
         .map_err(PublicKeysError::CouldntFetchPublicKeys)?;
@@ -70,7 +68,7 @@ async fn get_public_keys() -> Result<JwkKeys, PublicKeysError> {
 
     Ok(JwkKeys {
         keys: public_keys.keys,
-        max_age: max_age.unwrap_or(FALLBACK_TIMEOUT),
+        max_age: max_age.unwrap_or(fallback_timeout.clone()),
     })
 }
 
@@ -104,8 +102,9 @@ fn verify_id_token_with_project_id<T: DeserializeOwned>(
     config: &JwkConfiguration,
     public_keys: &JwkKeys,
     token: &str,
+    allow_unsigned_tokens: bool
 ) -> Result<T, VerificationError> {
-    if env::var("FIREBASE_AUTH_EMULATOR_HOST").is_ok() {
+    if allow_unsigned_tokens {
         return extract_claims_from_unsigned_token(token);
     }
     
@@ -152,12 +151,58 @@ impl JwkVerifier {
         }
     }
 
-    fn verify<T: DeserializeOwned>(&self, token: &str) -> Result<T, VerificationError> {
-        verify_id_token_with_project_id(&self.config, &self.keys, token)
+    fn verify<T: DeserializeOwned>(&self, token: &str, allow_unsigned_tokens: bool) -> Result<T, VerificationError> {
+        verify_id_token_with_project_id(&self.config, &self.keys, token, allow_unsigned_tokens)
     }
 
     fn set_keys(&mut self, keys: JwkKeys) {
         self.keys = keys;
+    }
+}
+
+pub struct FirebaseAuthBuilder<'a> {
+    project_id: &'a str,
+    fallback_timeout: Duration,
+    allow_unsigned_tokens: bool,
+}
+impl<'a> FirebaseAuthBuilder<'a> {
+    pub fn new(project_id: &'a str) -> FirebaseAuthBuilder<'a> {
+        FirebaseAuthBuilder {
+            project_id: project_id,
+            fallback_timeout: Duration::from_secs(60),
+            allow_unsigned_tokens: false,
+        }
+    }
+
+    pub fn allow_unsigned_tokens(mut self) -> FirebaseAuthBuilder<'a> {
+        self.allow_unsigned_tokens = true;
+        self
+    }
+
+    pub fn with_fallback_timeout(mut self, timeout: Duration) -> FirebaseAuthBuilder<'a> {
+        self.fallback_timeout = timeout;
+        self
+    }
+
+    pub async fn build(self) -> FirebaseAuth {
+        let jwk_keys: JwkKeys = match get_public_keys(&self.fallback_timeout).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("Error getting public jwk keys {:?}", e);
+                panic!("Unable to get public jwk keys! Cannot verify user tokens! Shutting down...")
+            }
+        };
+        let verifier = Arc::new(RwLock::new(JwkVerifier::new(self.project_id, jwk_keys)));
+
+        let mut instance = FirebaseAuth {
+            fallback_timeout: self.fallback_timeout,
+            allow_unsigned_tokens: self.allow_unsigned_tokens,
+            verifier,
+            handler: Arc::new(Mutex::new(Box::new(tokio::spawn(async {})))),
+        };
+
+        instance.start_key_update();
+        instance
     }
 }
 
@@ -166,6 +211,8 @@ impl JwkVerifier {
 /// If there is an error during refreshing, automatically retry indefinitely every 10 seconds.
 #[derive(Clone)]
 pub struct FirebaseAuth {
+    fallback_timeout: Duration,
+    allow_unsigned_tokens: bool,
     verifier: Arc<RwLock<JwkVerifier>>,
     handler: Arc<Mutex<Box<JoinHandle<()>>>>,
 }
@@ -179,36 +226,18 @@ impl Drop for FirebaseAuth {
 }
 
 impl FirebaseAuth {
-    pub async fn new(project_id: &str) -> FirebaseAuth {
-        let jwk_keys: JwkKeys = match get_public_keys().await {
-            Ok(keys) => keys,
-            Err(e) => {
-                eprintln!("Error getting public jwk keys {:?}", e);
-                panic!("Unable to get public jwk keys! Cannot verify user tokens! Shutting down...")
-            }
-        };
-        let verifier = Arc::new(RwLock::new(JwkVerifier::new(project_id, jwk_keys)));
-
-        let mut instance = FirebaseAuth {
-            verifier,
-            handler: Arc::new(Mutex::new(Box::new(tokio::spawn(async {})))),
-        };
-
-        instance.start_key_update();
-        instance
-    }
-
     pub fn verify<T: DeserializeOwned>(&self, token: &str) -> Result<T, VerificationError> {
         let verifier = self.verifier.read().unwrap();
-        verifier.verify(token)
+        verifier.verify(token, self.allow_unsigned_tokens)
     }
 
     fn start_key_update(&mut self) {
         let verifier_ref = Arc::clone(&self.verifier);
 
+        let fallback_timeout = self.fallback_timeout.clone();
         let task = tokio::spawn(async move {
             loop {
-                let delay = match get_public_keys().await {
+                let delay = match get_public_keys(&fallback_timeout).await {
                     Ok(jwk_keys) => {
                         let mut verifier = verifier_ref.write().unwrap();
                         verifier.set_keys(jwk_keys.clone());
